@@ -1,0 +1,13 @@
+Package: com.axs.ocr
+Name: Axs ocr
+Version: 5.2.0
+Architecture: iphoneos-arm64
+Description: 这是一款调用系统ocr识别的插件
+ * 1. 在任意界面识别屏幕文字，结果可选择并一键复制。
+ * 2. 通过深链接 prefs:root=axsocr_recognize 触发，可配合 GesturePro 手势使用。
+Maintainer: Axs
+Author: Axs
+Section: Axs-Tweaks
+Depends: mobilesubstrate (>= 0.9.5000), preferenceloader, firmware (>= 15.0)
+Icon: https://axs66.github.io/pro/icon/ocr.png
+SileoDepiction: https://axs66.github.io/pro/sileodepiction/ocr/js.json
