@@ -1,9 +1,20 @@
 #import "AxsOcrRecognizer.h"
+#import "AxsOcrPaths.h"
 #import <UIKit/UIKit.h>
-#import <Vision/Vision.h>
 #import <dlfcn.h>
+#import <errno.h>
+#import <fcntl.h>
+#import <poll.h>
+#import <signal.h>
+#import <spawn.h>
+#import <sys/wait.h>
+#import <unistd.h>
+
+extern char **environ;
 
 static NSString * const AxsOcrErrorDomain = @"com.axs.ocr";
+static NSString * const AxsOcrHelperPath = @"/usr/libexec/AxsOcrHelper";
+static const NSTimeInterval AxsOcrHelperTimeout = 25.0;
 
 typedef CGImageRef (*AxsOcrScreenImageFunc)(void);
 typedef UIImage *(*AxsOcrScreenUIImageFunc)(void);
@@ -32,72 +43,113 @@ static UIImage *axs_ocr_captureScreen(void) {
     return nil;
 }
 
-static NSArray<NSString *> *axs_ocr_languages(VNRecognizeTextRequest *request) {
-    NSError *error = nil;
-    NSArray<NSString *> *supported = [request supportedRecognitionLanguagesAndReturnError:&error];
-    if (supported.count == 0) return nil;
-    NSMutableArray<NSString *> *languages = [NSMutableArray array];
-    for (NSString *language in @[@"zh-Hans", @"zh-Hant", @"en-US"]) {
-        if ([supported containsObject:language]) [languages addObject:language];
+// Runs the helper on an image file and returns its stdout (possibly empty).
+// Returns nil with *error set when the helper cannot start, times out, or fails.
+// Vision runs in the helper, never in this process: loading its text model inside
+// SpringBoard crashed it (SIGTRAP in AppleNeuralEngine) and caused safe mode.
+static NSString *axs_ocr_runHelper(NSString *imagePath, BOOL fast, NSError **error) {
+    NSString *helperPath = axs_ocr_resourcePath(AxsOcrHelperPath);
+    if (access(helperPath.fileSystemRepresentation, X_OK) != 0) {
+        if (error) *error = axs_ocr_error(10, @"找不到识别组件，请重新安装插件");
+        return nil;
     }
-    return languages.count > 0 ? languages : nil;
-}
 
-// Always CPU only. In SpringBoard the Neural Engine path failed with "error computing MM outputs"
-// and then crashed while Vision tore the model down (SIGTRAP, "Semaphore object deallocated while
-// in use" in AppleNeuralEngine), which sends the device to safe mode. A crash cannot be retried,
-// so the Neural Engine is never used at all.
-// attempt 0: accurate, fixed languages, language correction on.
-// attempt 1: fast, language correction off.
-// Returns the recognized text (possibly empty), or nil with *error set when the request failed.
-static NSString *axs_ocr_runRequest(CGImageRef cgImage, NSInteger attempt, NSError **error) {
-    VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:nil];
-    request.recognitionLevel = attempt >= 1 ? VNRequestTextRecognitionLevelFast
-                                            : VNRequestTextRecognitionLevelAccurate;
-    request.usesLanguageCorrection = attempt < 1;
-    NSArray<NSString *> *languages = axs_ocr_languages(request);
-    if (languages) request.recognitionLanguages = languages;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    request.usesCPUOnly = YES;
-#pragma clang diagnostic pop
-
-    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cgImage options:@{}];
-    if (![handler performRequests:@[request] error:error]) return nil;
-
-    NSMutableArray<NSString *> *lines = [NSMutableArray array];
-    for (VNRecognizedTextObservation *observation in request.results) {
-        NSString *line = [observation topCandidates:1].firstObject.string;
-        if (line.length > 0) [lines addObject:line];
+    int outPipe[2];
+    if (pipe(outPipe) != 0) {
+        if (error) *error = axs_ocr_error(11, @"无法创建管道");
+        return nil;
     }
-    return [lines componentsJoinedByString:@"\n"];
+    // The child gets stdout through dup2 below; its copies of the pipe ends close on exec.
+    fcntl(outPipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(outPipe[1], F_SETFD, FD_CLOEXEC);
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, outPipe[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+    const char *helper = helperPath.fileSystemRepresentation;
+    const char *argv[] = { helper, fast ? "--fast" : "--accurate", imagePath.fileSystemRepresentation, NULL };
+    pid_t pid = 0;
+    int spawnResult = posix_spawn(&pid, helper, &actions, NULL, (char *const *)argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(outPipe[1]);
+    if (spawnResult != 0) {
+        close(outPipe[0]);
+        if (error) *error = axs_ocr_error(12, @"无法启动识别组件");
+        return nil;
+    }
+
+    NSMutableData *output = [NSMutableData data];
+    CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + AxsOcrHelperTimeout;
+    BOOL timedOut = NO;
+    for (;;) {
+        int remaining = (int)((deadline - CFAbsoluteTimeGetCurrent()) * 1000);
+        if (remaining <= 0) { timedOut = YES; break; }
+        struct pollfd descriptor = { outPipe[0], POLLIN, 0 };
+        int ready = poll(&descriptor, 1, remaining);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ready == 0) { timedOut = YES; break; }
+        char buffer[4096];
+        ssize_t count = read(outPipe[0], buffer, sizeof(buffer));
+        if (count > 0) [output appendBytes:buffer length:(NSUInteger)count];
+        else if (count == 0) break;                 // EOF: the helper exited
+        else if (errno != EINTR) break;
+    }
+    close(outPipe[0]);
+    if (timedOut) kill(pid, SIGKILL);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+
+    if (timedOut) {
+        if (error) *error = axs_ocr_error(13, @"识别超时");
+        return nil;
+    }
+    if (WIFSIGNALED(status)) {
+        if (error) *error = axs_ocr_error(14, [NSString stringWithFormat:@"识别组件异常退出（信号 %d）", WTERMSIG(status)]);
+        return nil;
+    }
+    if (WEXITSTATUS(status) != 0) {
+        if (error) *error = axs_ocr_error(15, [NSString stringWithFormat:@"识别失败（代码 %d）", WEXITSTATUS(status)]);
+        return nil;
+    }
+    return [[NSString alloc] initWithData:output encoding:NSUTF8StringEncoding] ?: @"";
 }
 
 @implementation AxsOcrRecognizer
 
 + (void)axs_ocr_recognizeScreenWithCompletion:(AxsOcrCompletion)completion {
     UIImage *image = axs_ocr_captureScreen();
-    CGImageRef cgImage = image.CGImage;
-    if (!cgImage) {
+    if (!image) {
         completion(nil, axs_ocr_error(1, @"无法截取屏幕"));
         return;
     }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        // If accurate mode fails on the CPU, fall back to fast mode once.
+        NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                          [NSString stringWithFormat:@"axsocr-%@.png", [NSUUID UUID].UUIDString]];
+        NSData *png = UIImagePNGRepresentation(image);
         NSError *error = nil;
         NSString *text = nil;
-        BOOL ok = NO;
-        for (NSInteger attempt = 0; attempt < 2 && !ok; attempt++) {
-            error = nil;
-            text = axs_ocr_runRequest(cgImage, attempt, &error);
-            ok = (text != nil);
+        if (!png || ![png writeToFile:path options:NSDataWritingAtomic error:&error]) {
+            error = error ?: axs_ocr_error(2, @"无法保存截图");
+        } else {
+            // Accurate first; if that fails or crashes in the helper, retry once in fast mode.
+            for (NSInteger attempt = 0; attempt < 2 && !text; attempt++) {
+                error = nil;
+                text = axs_ocr_runHelper(path, attempt > 0, &error);
+            }
+            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!ok) {
-                completion(nil, error ?: axs_ocr_error(2, @"识别失败"));
+            if (!text) {
+                completion(nil, error ?: axs_ocr_error(3, @"识别失败"));
             } else if (text.length == 0) {
-                completion(nil, axs_ocr_error(3, @"没有识别到文字"));
+                completion(nil, axs_ocr_error(4, @"没有识别到文字"));
             } else {
                 completion(text, nil);
             }
