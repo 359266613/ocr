@@ -43,27 +43,24 @@ static NSArray<NSString *> *axs_ocr_languages(VNRecognizeTextRequest *request) {
     return languages.count > 0 ? languages : nil;
 }
 
-// attempt 0: accurate, GPU/ANE allowed, language detection on iOS 16+.
-// attempt 1: accurate, CPU only, fixed languages.
-// attempt 2: fast, CPU only, no language correction.
+// Always CPU only. In SpringBoard the Neural Engine path failed with "error computing MM outputs"
+// and then crashed while Vision tore the model down (SIGTRAP, "Semaphore object deallocated while
+// in use" in AppleNeuralEngine), which sends the device to safe mode. A crash cannot be retried,
+// so the Neural Engine is never used at all.
+// attempt 0: accurate, fixed languages, language correction on.
+// attempt 1: fast, language correction off.
 // Returns the recognized text (possibly empty), or nil with *error set when the request failed.
 static NSString *axs_ocr_runRequest(CGImageRef cgImage, NSInteger attempt, NSError **error) {
     VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:nil];
-    request.recognitionLevel = attempt >= 2 ? VNRequestTextRecognitionLevelFast
+    request.recognitionLevel = attempt >= 1 ? VNRequestTextRecognitionLevelFast
                                             : VNRequestTextRecognitionLevelAccurate;
-    request.usesLanguageCorrection = attempt < 2;
+    request.usesLanguageCorrection = attempt < 1;
     NSArray<NSString *> *languages = axs_ocr_languages(request);
     if (languages) request.recognitionLanguages = languages;
-    if (attempt == 0) {
-        if (@available(iOS 16.0, *)) {
-            request.automaticallyDetectsLanguage = YES;
-        }
-    } else {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        request.usesCPUOnly = YES;
+    request.usesCPUOnly = YES;
 #pragma clang diagnostic pop
-    }
 
     VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cgImage options:@{}];
     if (![handler performRequests:@[request] error:error]) return nil;
@@ -86,12 +83,11 @@ static NSString *axs_ocr_runRequest(CGImageRef cgImage, NSInteger attempt, NSErr
         return;
     }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        // A failure such as "error computing MM outputs" comes from the neural-network backend,
-        // so retry with progressively lighter settings instead of giving up on the first error.
+        // If accurate mode fails on the CPU, fall back to fast mode once.
         NSError *error = nil;
         NSString *text = nil;
         BOOL ok = NO;
-        for (NSInteger attempt = 0; attempt < 3 && !ok; attempt++) {
+        for (NSInteger attempt = 0; attempt < 2 && !ok; attempt++) {
             error = nil;
             text = axs_ocr_runRequest(cgImage, attempt, &error);
             ok = (text != nil);
