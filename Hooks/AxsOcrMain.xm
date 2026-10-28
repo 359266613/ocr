@@ -50,7 +50,17 @@ static BOOL axs_ocr_handleURL(NSURL *url) {
     return YES;
 }
 
-// In-process callers such as GesturePro's URL action.
+// GesturePro's URL action calls this private SpringBoard method directly.
+%hook SpringBoard
+
+- (void)applicationOpenURL:(id)url {
+    if ([url isKindOfClass:[NSURL class]] && axs_ocr_handleURL(url)) return;
+    %orig;
+}
+
+%end
+
+// Other in-process callers that go through the public API.
 %hook UIApplication
 
 - (void)openURL:(NSURL *)url options:(NSDictionary *)options completionHandler:(void (^)(BOOL))completion {
