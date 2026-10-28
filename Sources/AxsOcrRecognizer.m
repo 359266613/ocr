@@ -118,8 +118,7 @@ static NSString *axs_ocr_runHelper(NSString *imagePath, BOOL allowAnyDevice, NSE
         return nil;
     }
     NSString *text = [[NSString alloc] initWithData:output encoding:NSUTF8StringEncoding] ?: @"";
-    axs_ocr_log(@"helper done: exited=%d code=%d signaled=%d signal=%d outputBytes=%lu
-%@",
+    axs_ocr_log(@"helper done: exited=%d code=%d signaled=%d signal=%d outputBytes=%lu\n%@",
                 WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
                 WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : 0,
                 (unsigned long)output.length, text.length > 1500 ? [text substringToIndex:1500] : text);
