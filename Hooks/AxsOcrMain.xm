@@ -29,7 +29,8 @@ static void axs_ocr_recognizeNow(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [AxsOcrRecognizer axs_ocr_recognizeScreenWithCompletion:^(NSString *text, NSError *error) {
             if (text) [AxsOcrPanel axs_ocr_showText:text copyable:YES];
-            else [AxsOcrPanel axs_ocr_showText:error.localizedDescription ?: @"识别失败" copyable:NO];
+            // Errors are copyable too so the full diagnostic text can be pasted into a bug report.
+            else [AxsOcrPanel axs_ocr_showText:error.localizedDescription ?: @"识别失败" copyable:YES];
         }];
     });
 }
