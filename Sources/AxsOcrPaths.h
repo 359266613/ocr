@@ -25,3 +25,12 @@ static inline NSString *axs_ocr_preferencesPath(void) {
     return path;
 #endif
 }
+
+static inline NSString *axs_ocr_logPath(void) {
+    NSString *path = @"/var/mobile/Library/Logs/AxsOcr.log";
+#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
+    return jbroot(path);
+#else
+    return path;
+#endif
+}

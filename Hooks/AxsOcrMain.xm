@@ -3,6 +3,7 @@
 #import "AxsOcrPrivate.h"
 #import "AxsOcrRecognizer.h"
 #import "AxsOcrPanel.h"
+#import "AxsOcrLog.h"
 
 // Deep link: prefs:root=axsocr_recognize (app-prefs: works too)
 // GesturePro (or any SpringBoard code) triggers it with a URL action.
@@ -39,7 +40,9 @@ static void axs_ocr_recognizeNow(void) {
 static BOOL axs_ocr_handleURL(NSURL *url) {
     if (![axs_ocr_rootValue(url) isEqualToString:AxsOcrRootValue]) return NO;
     // Disabled: still swallow the link so a stray trigger does not open Settings.
-    if (![[AxsOcrConfig axs_ocr_shared] axs_ocr_isEnabled]) return YES;
+    BOOL enabled = [[AxsOcrConfig axs_ocr_shared] axs_ocr_isEnabled];
+    axs_ocr_log(@"trigger: url=%@ enabled=%d", url.absoluteString, enabled);
+    if (!enabled) return YES;
 
     // Ignore repeated triggers fired in quick succession.
     static CFAbsoluteTime lastTime = 0;

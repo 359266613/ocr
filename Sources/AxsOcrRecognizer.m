@@ -1,5 +1,6 @@
 #import "AxsOcrRecognizer.h"
 #import "AxsOcrPaths.h"
+#import "AxsOcrLog.h"
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <errno.h>
@@ -49,7 +50,9 @@ static UIImage *axs_ocr_captureScreen(void) {
 // SpringBoard crashed it (SIGTRAP in AppleNeuralEngine) and caused safe mode.
 static NSString *axs_ocr_runHelper(NSString *imagePath, BOOL allowAnyDevice, NSError **error) {
     NSString *helperPath = axs_ocr_resourcePath(AxsOcrHelperPath);
+    axs_ocr_log(@"helper start: path=%@ mode=%@ image=%@", helperPath, allowAnyDevice ? @"any" : @"safe", imagePath);
     if (access(helperPath.fileSystemRepresentation, X_OK) != 0) {
+        axs_ocr_log(@"helper not executable: errno=%d", errno);
         if (error) *error = axs_ocr_error(10, @"找不到识别组件，请重新安装插件");
         return nil;
     }
@@ -75,6 +78,7 @@ static NSString *axs_ocr_runHelper(NSString *imagePath, BOOL allowAnyDevice, NSE
     posix_spawn_file_actions_destroy(&actions);
     close(outPipe[1]);
     if (spawnResult != 0) {
+        axs_ocr_log(@"posix_spawn failed: %d", spawnResult);
         close(outPipe[0]);
         if (error) *error = axs_ocr_error(12, @"无法启动识别组件");
         return nil;
@@ -114,6 +118,11 @@ static NSString *axs_ocr_runHelper(NSString *imagePath, BOOL allowAnyDevice, NSE
         return nil;
     }
     NSString *text = [[NSString alloc] initWithData:output encoding:NSUTF8StringEncoding] ?: @"";
+    axs_ocr_log(@"helper done: exited=%d code=%d signaled=%d signal=%d outputBytes=%lu
+%@",
+                WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : 0,
+                (unsigned long)output.length, text.length > 1500 ? [text substringToIndex:1500] : text);
     if (WEXITSTATUS(status) != 0) {
         // On failure the helper prints the Vision error messages instead of text.
         NSString *detail = text.length > 0 ? [NSString stringWithFormat:@"\n%@", text] : @"";
@@ -127,6 +136,8 @@ static NSString *axs_ocr_runHelper(NSString *imagePath, BOOL allowAnyDevice, NSE
 
 + (void)axs_ocr_recognizeScreenWithCompletion:(AxsOcrCompletion)completion {
     UIImage *image = axs_ocr_captureScreen();
+    axs_ocr_log(@"capture: %@ size=%@ scale=%.1f", image ? @"ok" : @"FAILED",
+                image ? NSStringFromCGSize(image.size) : @"-", image ? image.scale : 0.0);
     if (!image) {
         completion(nil, axs_ocr_error(1, @"无法截取屏幕"));
         return;
@@ -139,6 +150,7 @@ static NSString *axs_ocr_runHelper(NSString *imagePath, BOOL allowAnyDevice, NSE
         NSString *text = nil;
         if (!png || ![png writeToFile:path options:NSDataWritingAtomic error:&error]) {
             error = error ?: axs_ocr_error(2, @"无法保存截图");
+            axs_ocr_log(@"save png failed: %@ (tmp dir %@)", error, NSTemporaryDirectory());
         } else {
             // CPU-only first; if that fails, let the helper try the default compute devices.
             // A crash there only kills the helper process.
