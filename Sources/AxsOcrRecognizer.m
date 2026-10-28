@@ -47,7 +47,7 @@ static UIImage *axs_ocr_captureScreen(void) {
 // Returns nil with *error set when the helper cannot start, times out, or fails.
 // Vision runs in the helper, never in this process: loading its text model inside
 // SpringBoard crashed it (SIGTRAP in AppleNeuralEngine) and caused safe mode.
-static NSString *axs_ocr_runHelper(NSString *imagePath, BOOL fast, NSError **error) {
+static NSString *axs_ocr_runHelper(NSString *imagePath, BOOL allowAnyDevice, NSError **error) {
     NSString *helperPath = axs_ocr_resourcePath(AxsOcrHelperPath);
     if (access(helperPath.fileSystemRepresentation, X_OK) != 0) {
         if (error) *error = axs_ocr_error(10, @"找不到识别组件，请重新安装插件");
@@ -69,7 +69,7 @@ static NSString *axs_ocr_runHelper(NSString *imagePath, BOOL fast, NSError **err
     posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
 
     const char *helper = helperPath.fileSystemRepresentation;
-    const char *argv[] = { helper, fast ? "--fast" : "--accurate", imagePath.fileSystemRepresentation, NULL };
+    const char *argv[] = { helper, allowAnyDevice ? "--any" : "--safe", imagePath.fileSystemRepresentation, NULL };
     pid_t pid = 0;
     int spawnResult = posix_spawn(&pid, helper, &actions, NULL, (char *const *)argv, environ);
     posix_spawn_file_actions_destroy(&actions);
@@ -113,11 +113,14 @@ static NSString *axs_ocr_runHelper(NSString *imagePath, BOOL fast, NSError **err
         if (error) *error = axs_ocr_error(14, [NSString stringWithFormat:@"识别组件异常退出（信号 %d）", WTERMSIG(status)]);
         return nil;
     }
+    NSString *text = [[NSString alloc] initWithData:output encoding:NSUTF8StringEncoding] ?: @"";
     if (WEXITSTATUS(status) != 0) {
-        if (error) *error = axs_ocr_error(15, [NSString stringWithFormat:@"识别失败（代码 %d）", WEXITSTATUS(status)]);
+        // On failure the helper prints the Vision error messages instead of text.
+        NSString *detail = text.length > 0 ? [NSString stringWithFormat:@"\n%@", text] : @"";
+        if (error) *error = axs_ocr_error(15, [NSString stringWithFormat:@"识别失败（代码 %d）%@", WEXITSTATUS(status), detail]);
         return nil;
     }
-    return [[NSString alloc] initWithData:output encoding:NSUTF8StringEncoding] ?: @"";
+    return text;
 }
 
 @implementation AxsOcrRecognizer
@@ -137,7 +140,8 @@ static NSString *axs_ocr_runHelper(NSString *imagePath, BOOL fast, NSError **err
         if (!png || ![png writeToFile:path options:NSDataWritingAtomic error:&error]) {
             error = error ?: axs_ocr_error(2, @"无法保存截图");
         } else {
-            // Accurate first; if that fails or crashes in the helper, retry once in fast mode.
+            // CPU-only first; if that fails, let the helper try the default compute devices.
+            // A crash there only kills the helper process.
             for (NSInteger attempt = 0; attempt < 2 && !text; attempt++) {
                 error = nil;
                 text = axs_ocr_runHelper(path, attempt > 0, &error);
