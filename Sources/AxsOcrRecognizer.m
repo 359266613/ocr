@@ -43,6 +43,39 @@ static NSArray<NSString *> *axs_ocr_languages(VNRecognizeTextRequest *request) {
     return languages.count > 0 ? languages : nil;
 }
 
+// attempt 0: accurate, GPU/ANE allowed, language detection on iOS 16+.
+// attempt 1: accurate, CPU only, fixed languages.
+// attempt 2: fast, CPU only, no language correction.
+// Returns the recognized text (possibly empty), or nil with *error set when the request failed.
+static NSString *axs_ocr_runRequest(CGImageRef cgImage, NSInteger attempt, NSError **error) {
+    VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:nil];
+    request.recognitionLevel = attempt >= 2 ? VNRequestTextRecognitionLevelFast
+                                            : VNRequestTextRecognitionLevelAccurate;
+    request.usesLanguageCorrection = attempt < 2;
+    NSArray<NSString *> *languages = axs_ocr_languages(request);
+    if (languages) request.recognitionLanguages = languages;
+    if (attempt == 0) {
+        if (@available(iOS 16.0, *)) {
+            request.automaticallyDetectsLanguage = YES;
+        }
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        request.usesCPUOnly = YES;
+#pragma clang diagnostic pop
+    }
+
+    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cgImage options:@{}];
+    if (![handler performRequests:@[request] error:error]) return nil;
+
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    for (VNRecognizedTextObservation *observation in request.results) {
+        NSString *line = [observation topCandidates:1].firstObject.string;
+        if (line.length > 0) [lines addObject:line];
+    }
+    return [lines componentsJoinedByString:@"\n"];
+}
+
 @implementation AxsOcrRecognizer
 
 + (void)axs_ocr_recognizeScreenWithCompletion:(AxsOcrCompletion)completion {
@@ -53,25 +86,16 @@ static NSArray<NSString *> *axs_ocr_languages(VNRecognizeTextRequest *request) {
         return;
     }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:nil];
-        request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
-        request.usesLanguageCorrection = YES;
-        NSArray<NSString *> *languages = axs_ocr_languages(request);
-        if (languages) request.recognitionLanguages = languages;
-        if (@available(iOS 16.0, *)) {
-            request.automaticallyDetectsLanguage = YES;
-        }
-
-        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cgImage options:@{}];
+        // A failure such as "error computing MM outputs" comes from the neural-network backend,
+        // so retry with progressively lighter settings instead of giving up on the first error.
         NSError *error = nil;
-        BOOL ok = [handler performRequests:@[request] error:&error];
-
-        NSMutableArray<NSString *> *lines = [NSMutableArray array];
-        for (VNRecognizedTextObservation *observation in request.results) {
-            NSString *line = [observation topCandidates:1].firstObject.string;
-            if (line.length > 0) [lines addObject:line];
+        NSString *text = nil;
+        BOOL ok = NO;
+        for (NSInteger attempt = 0; attempt < 3 && !ok; attempt++) {
+            error = nil;
+            text = axs_ocr_runRequest(cgImage, attempt, &error);
+            ok = (text != nil);
         }
-        NSString *text = [lines componentsJoinedByString:@"\n"];
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!ok) {
