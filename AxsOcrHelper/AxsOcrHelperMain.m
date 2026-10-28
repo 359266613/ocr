@@ -140,8 +140,15 @@ int main(int argc, char **argv) {
                 fputs(text.UTF8String, stdout);
                 axs_ocr_helper_finish(0);
             }
-            // The first line of each message is enough to tell the failure modes apart.
-            NSString *reason = [error.localizedDescription componentsSeparatedByString:@"\n"].firstObject;
+            // Keep the full message: the cause of a buffer failure may sit after the first line.
+            NSString *reason = error.localizedDescription;
+            if (error.localizedFailureReason.length > 0) {
+                reason = [reason stringByAppendingFormat:@" | %@", error.localizedFailureReason];
+            }
+            NSError *underlying = error.userInfo[NSUnderlyingErrorKey];
+            if (underlying) {
+                reason = [reason stringByAppendingFormat:@" | underlying: %@", underlying.localizedDescription];
+            }
             [failures addObject:[NSString stringWithFormat:@"%@%@%@: %@",
                                  config.fast ? @"fast" : @"accurate",
                                  config.cpuOnly ? @"+cpu" : @"",
